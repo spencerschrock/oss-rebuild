@@ -11,8 +11,8 @@ import (
 	"github.com/google/oss-rebuild/pkg/build"
 )
 
-// localHandle implements build.Handle for local Docker builds
-type localHandle struct {
+// LocalHandle implements build.Handle for local Docker builds
+type LocalHandle struct {
 	id         string
 	cancel     context.CancelFunc
 	output     io.ReadWriteCloser
@@ -23,12 +23,12 @@ type localHandle struct {
 }
 
 // BuildID implements build.Handle
-func (h *localHandle) BuildID() string {
+func (h *LocalHandle) BuildID() string {
 	return h.id
 }
 
 // Wait implements build.Handle
-func (h *localHandle) Wait(ctx context.Context) (build.Result, error) {
+func (h *LocalHandle) Wait(ctx context.Context) (build.Result, error) {
 	defer h.output.Close()
 	select {
 	case result := <-h.resultChan:
@@ -40,32 +40,32 @@ func (h *localHandle) Wait(ctx context.Context) (build.Result, error) {
 }
 
 // OutputStream implements build.Handle
-func (h *localHandle) OutputStream() io.Reader {
+func (h *LocalHandle) OutputStream() io.Reader {
 	return h.output
 }
 
 // Status implements build.Handle
-func (h *localHandle) Status() build.BuildState {
+func (h *LocalHandle) Status() build.BuildState {
 	h.statusMu.RLock()
 	defer h.statusMu.RUnlock()
 	return h.status
 }
 
 // Cancel cancels the build
-func (h *localHandle) Cancel() {
+func (h *LocalHandle) Cancel() {
 	defer h.output.Close()
 	h.cancel()
 }
 
-// updateStatus updates the handle's status
-func (h *localHandle) updateStatus(state build.BuildState) {
+// UpdateStatus updates the handle's status
+func (h *LocalHandle) UpdateStatus(state build.BuildState) {
 	h.statusMu.Lock()
 	defer h.statusMu.Unlock()
 	h.status = state
 }
 
-// setResult sets the final result and closes the result channel
-func (h *localHandle) setResult(result build.Result) {
+// SetResult sets the final result and closes the result channel
+func (h *LocalHandle) SetResult(result build.Result) {
 	select {
 	case h.resultChan <- result:
 	default:
@@ -74,6 +74,17 @@ func (h *localHandle) setResult(result build.Result) {
 }
 
 // writeOutput writes a line to the output stream
-func (h *localHandle) Write(line []byte) (n int, err error) {
+func (h *LocalHandle) Write(line []byte) (n int, err error) {
 	return h.output.Write(line)
+}
+
+// NewLocalHandle creates a new LocalHandle
+func NewLocalHandle(id string, cancel context.CancelFunc, output io.ReadWriteCloser) *LocalHandle {
+	return &LocalHandle{
+		id:         id,
+		cancel:     cancel,
+		output:     output,
+		resultChan: make(chan build.Result, 1),
+		status:     build.BuildStateStarting,
+	}
 }

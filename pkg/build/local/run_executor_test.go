@@ -14,6 +14,7 @@ import (
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/oss-rebuild/pkg/build"
+	dockerlocal "github.com/google/oss-rebuild/pkg/docker/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
 	"github.com/pkg/errors"
 )
@@ -44,9 +45,9 @@ type testCase struct {
 	options          build.Options
 	maxParallel      int
 	dockerCmd        string
-	executeFunc      func(ctx context.Context, opts CommandOptions, name string, args ...string) error
+	executeFunc      func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error
 	lookPathFunc     func(file string) (string, error)
-	expectedCommands []MockCommand
+	expectedCommands []dockerlocal.MockCommand
 	expectedError    string
 	expectSuccess    bool
 }
@@ -77,13 +78,13 @@ func TestDockerRunExecutor(t *testing.T) {
 			},
 			maxParallel: 2,
 			dockerCmd:   "docker",
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if opts.Output != nil {
 					opts.Output.Write([]byte("Build successful\n"))
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name: "docker",
 					Args: []string{"run", "--rm", "--name", "test-build-123", "-v", "/tmp/oss-rebuild-test-build-123:/out", "-w", "/workspace", "alpine:3.19", "/bin/sh", "-c", "echo hello"},
@@ -132,10 +133,10 @@ func TestDockerRunExecutor(t *testing.T) {
 				BuildID: "test-build-789",
 			},
 			maxParallel: 1,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				return errors.New("exit status 1")
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name:  "docker",
 					Args:  []string{"run", "--rm", "--name", "test-build-789", "-v", "/tmp/oss-rebuild-test-build-789:/out", "alpine:3.19", "/bin/sh", "-c", "false"},
@@ -179,7 +180,7 @@ func TestDockerRunExecutor(t *testing.T) {
 				Timeout: 50 * time.Millisecond,
 			},
 			maxParallel: 1,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				select {
 				case <-time.After(100 * time.Millisecond):
 					return nil
@@ -208,13 +209,13 @@ func TestDockerRunExecutor(t *testing.T) {
 				BuildID: "test-build-workdir",
 			},
 			maxParallel: 1,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if opts.Output != nil {
 					opts.Output.Write([]byte("/custom/workdir\n"))
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name: "docker",
 					Args: []string{"run", "--rm", "--name", "test-build-workdir", "-v", "/tmp/oss-rebuild-test-build-workdir:/out", "-w", "/custom/workdir", "ubuntu:20.04", "/bin/sh", "-c", "pwd"},
@@ -226,7 +227,7 @@ func TestDockerRunExecutor(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup mock command executor
-			cmdExecutor := NewMockCommandExecutor()
+			cmdExecutor := dockerlocal.NewMockCommandExecutor()
 			if tc.executeFunc != nil {
 				cmdExecutor.SetExecuteFunc(tc.executeFunc)
 			}
@@ -310,12 +311,12 @@ func TestDockerRunExecutor(t *testing.T) {
 
 func TestDockerRunExecutorConcurrency(t *testing.T) {
 	maxParallel := 2
-	cmdExecutor := NewMockCommandExecutor()
+	cmdExecutor := dockerlocal.NewMockCommandExecutor()
 	// Setup slow execution to test concurrency
 	var activeBuilds int32
 	var maxActiveBuilds int32
 	var mu sync.Mutex
-	cmdExecutor.SetExecuteFunc(func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+	cmdExecutor.SetExecuteFunc(func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 		mu.Lock()
 		activeBuilds++
 		if activeBuilds > maxActiveBuilds {
@@ -391,7 +392,7 @@ func TestDockerRunExecutorConcurrency(t *testing.T) {
 func TestDockerRunExecutorConfig(t *testing.T) {
 	executor, err := NewDockerRunExecutor(DockerRunExecutorConfig{
 		MaxParallel:     3,
-		CommandExecutor: NewMockCommandExecutor(),
+		CommandExecutor: dockerlocal.NewMockCommandExecutor(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create executor with config: %v", err)

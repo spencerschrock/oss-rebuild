@@ -18,6 +18,7 @@ import (
 	"github.com/google/oss-rebuild/internal/bufiox"
 	"github.com/google/oss-rebuild/internal/syncx"
 	"github.com/google/oss-rebuild/pkg/build"
+	dockerlocal "github.com/google/oss-rebuild/pkg/docker/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
 	"github.com/pkg/errors"
 )
@@ -27,10 +28,9 @@ type DockerBuildExecutor struct {
 	planner          build.Planner[*DockerBuildPlan]
 	maxParallel      int
 	semaphore        chan struct{}
-	dockerCmd        string
+	client           dockerlocal.Client
 	outputDir        string
-	cmdExecutor      CommandExecutor
-	activeBuilds     syncx.Map[string, *localHandle]
+	activeBuilds     syncx.Map[string, *dockerlocal.LocalHandle]
 	outputBufferSize int
 	retainContainer  bool
 	retainImage      bool
@@ -47,7 +47,7 @@ func NewDockerBuildExecutor(config DockerBuildExecutorConfig) (*DockerBuildExecu
 	}
 	cmdExecutor := config.CommandExecutor
 	if cmdExecutor == nil {
-		cmdExecutor = NewRealCommandExecutor()
+		cmdExecutor = dockerlocal.NewRealCommandExecutor()
 	}
 	maxParallel := config.MaxParallel
 	if maxParallel <= 0 {
@@ -74,10 +74,9 @@ func NewDockerBuildExecutor(config DockerBuildExecutorConfig) (*DockerBuildExecu
 		planner:          planner,
 		maxParallel:      maxParallel,
 		semaphore:        make(chan struct{}, maxParallel),
-		dockerCmd:        dockerCmd,
+		client:           dockerlocal.NewRealClient(cmdExecutor, dockerCmd),
 		outputDir:        outputDir,
-		cmdExecutor:      cmdExecutor,
-		activeBuilds:     syncx.Map[string, *localHandle]{},
+		activeBuilds:     syncx.Map[string, *dockerlocal.LocalHandle]{},
 		outputBufferSize: outputBufferSize,
 		retainContainer:  config.RetainContainer,
 		retainImage:      config.RetainImage,
@@ -89,7 +88,7 @@ func NewDockerBuildExecutor(config DockerBuildExecutorConfig) (*DockerBuildExecu
 // DockerBuildExecutorConfig contains configuration for creating a Docker build executor
 type DockerBuildExecutorConfig struct {
 	Planner          build.Planner[*DockerBuildPlan]
-	CommandExecutor  CommandExecutor
+	CommandExecutor  dockerlocal.CommandExecutor
 	MaxParallel      int    // Max number of simultaneous builds
 	OutputDir        string // Directory for build outputs
 	OutputBufferSize int    // Buffer size for output pipe, defaults to 512KB
@@ -123,13 +122,7 @@ func (e *DockerBuildExecutor) Start(ctx context.Context, input rebuild.Input, op
 	}
 	// Create a buffered pipe for streaming output.
 	pipe := bufiox.NewBufferedPipe(bufiox.NewLineBuffer(e.outputBufferSize))
-	handle := &localHandle{
-		id:         buildID,
-		cancel:     cancel,
-		output:     pipe,
-		resultChan: make(chan build.Result, 1),
-		status:     build.BuildStateStarting,
-	}
+	handle := dockerlocal.NewLocalHandle(buildID, cancel, pipe)
 	e.activeBuilds.Store(buildID, handle)
 	// Start the build in a goroutine.
 	go e.executeBuild(buildCtx, handle, plan, input.Target, opts)
@@ -149,8 +142,8 @@ func (e *DockerBuildExecutor) Status() build.ExecutorStatus {
 func (e *DockerBuildExecutor) Close(ctx context.Context) error {
 	// Cancel all active builds.
 	for handle := range e.activeBuilds.Values() {
-		handle.cancel()
-		handle.updateStatus(build.BuildStateCancelled)
+		handle.Cancel()
+		handle.UpdateStatus(build.BuildStateCancelled)
 	}
 	// Wait for builds to finish or context timeout.
 	done := make(chan struct{})
@@ -169,55 +162,52 @@ func (e *DockerBuildExecutor) Close(ctx context.Context) error {
 }
 
 // executeBuild runs the actual Docker build process.
-func (e *DockerBuildExecutor) executeBuild(ctx context.Context, handle *localHandle, plan *DockerBuildPlan, t rebuild.Target, opts build.Options) {
+func (e *DockerBuildExecutor) executeBuild(ctx context.Context, handle *dockerlocal.LocalHandle, plan *DockerBuildPlan, t rebuild.Target, opts build.Options) {
 	// Ensure resources are cleaned up on exit.
-	defer e.activeBuilds.Delete(handle.id)
-	defer handle.output.Close()
+	defer e.activeBuilds.Delete(handle.BuildID())
+	defer handle.OutputStream().(io.Closer).Close()
 	// Acquire semaphore slot.
 	select {
 	case e.semaphore <- struct{}{}:
 		defer func() { <-e.semaphore }()
 	case <-ctx.Done():
-		handle.updateStatus(build.BuildStateCancelled)
-		handle.setResult(build.Result{
+		handle.UpdateStatus(build.BuildStateCancelled)
+		handle.SetResult(build.Result{
 			Error: errors.Wrap(ctx.Err(), "enqueuing build"),
 		})
 		return
 	}
 	// Generate host output path and create the directory.
-	hostOutputPath := filepath.Join(e.tempDirBase, fmt.Sprintf("oss-rebuild-%s", handle.id))
+	hostOutputPath := filepath.Join(e.tempDirBase, fmt.Sprintf("oss-rebuild-%s", handle.BuildID()))
 	if err := os.MkdirAll(hostOutputPath, 0755); err != nil {
-		handle.updateStatus(build.BuildStateCancelled)
-		handle.setResult(build.Result{
+		handle.UpdateStatus(build.BuildStateCancelled)
+		handle.SetResult(build.Result{
 			Error: errors.Wrap(err, "failed to create output directory"),
 		})
 		return
 	}
-	handle.updateStatus(build.BuildStateRunning)
+	handle.UpdateStatus(build.BuildStateRunning)
 	// Create a buffer to capture all output for asset upload.
 	outbuf := &bytes.Buffer{}
 	// Create a multi-writer to stream to the handle's output and capture to the buffer.
-	multiWriter := io.MultiWriter(handle.output, outbuf)
+	multiWriter := io.MultiWriter(handle, outbuf)
 	// Build Docker image with streaming and captured output.
-	imageTag := handle.id
-	buildArgs := []string{"buildx", "build", "-t", imageTag, "-"}
-	err := e.cmdExecutor.Execute(ctx, CommandOptions{
-		Input:  strings.NewReader(plan.Dockerfile),
-		Output: multiWriter,
-	}, e.dockerCmd, buildArgs...)
+	imageTag := handle.BuildID()
+
+	err := e.client.Build(ctx, imageTag, strings.NewReader(plan.Dockerfile), multiWriter)
 	if err != nil {
-		handle.updateStatus(build.BuildStateCompleted)
-		handle.setResult(build.Result{
+		handle.UpdateStatus(build.BuildStateCompleted)
+		handle.SetResult(build.Result{
 			Error: errors.Wrap(err, "docker build failed"),
 		})
 		return
 	}
 	// Run Docker container with streaming and captured output.
-	runArgs := []string{"run"}
+	var runArgs []string
 	if !e.retainContainer {
 		runArgs = append(runArgs, "--rm")
 	}
-	runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s", hostOutputPath, path.Dir(plan.OutputPath)), imageTag)
+	runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s", hostOutputPath, path.Dir(plan.OutputPath)))
 	if plan.Privileged {
 		if e.allowPrivileged {
 			runArgs = append(runArgs, "--privileged")
@@ -225,31 +215,30 @@ func (e *DockerBuildExecutor) executeBuild(ctx context.Context, handle *localHan
 			log.Println("Warning: plan requested privileged execution but this executor does not allow privileged builds.")
 		}
 	}
-	err = e.cmdExecutor.Execute(ctx, CommandOptions{
-		Output: multiWriter,
-	}, e.dockerCmd, runArgs...)
+
+	err = e.client.Run(ctx, imageTag, multiWriter, runArgs)
 	// Upload assets to asset store
 	if opts.Resources.AssetStore != nil {
-		e.uploadAssets(ctx, plan, hostOutputPath, t, opts, handle.id, outbuf.Bytes())
+		e.uploadAssets(ctx, plan, hostOutputPath, t, opts, handle.BuildID(), outbuf.Bytes())
 	}
 	// Clean up the built image if RetainImage is false
 	if !e.retainImage {
-		if rmErr := e.cmdExecutor.Execute(ctx, CommandOptions{}, e.dockerCmd, "rmi", imageTag); rmErr != nil {
+		if rmErr := e.client.Rmi(ctx, imageTag); rmErr != nil {
 			// Log the error but don't fail the build
 			log.Printf("Failed to remove Docker image %s: %v", imageTag, rmErr)
 		}
 	}
 	// If the run command failed, set the result with the error.
 	if err != nil {
-		handle.updateStatus(build.BuildStateCompleted)
-		handle.setResult(build.Result{
+		handle.UpdateStatus(build.BuildStateCompleted)
+		handle.SetResult(build.Result{
 			Error: errors.Wrap(err, "docker run failed"),
 		})
 		return
 	}
 	// Set final successful result.
-	handle.updateStatus(build.BuildStateCompleted)
-	handle.setResult(build.Result{Error: nil})
+	handle.UpdateStatus(build.BuildStateCompleted)
+	handle.SetResult(build.Result{Error: nil})
 }
 
 // uploadAssets uploads build artifacts to the asset store.
@@ -316,5 +305,5 @@ func (e *DockerBuildExecutor) uploadContent(ctx context.Context, store rebuild.A
 
 // saveContainerImage saves the built container image as a tarball.
 func (e *DockerBuildExecutor) saveContainerImage(ctx context.Context, imageTag, outputPath string) error {
-	return e.cmdExecutor.Execute(ctx, CommandOptions{}, e.dockerCmd, "save", "-o", outputPath, imageTag)
+	return e.client.Save(ctx, imageTag, outputPath)
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/google/oss-rebuild/internal/bufiox"
 	"github.com/google/oss-rebuild/internal/syncx"
 	"github.com/google/oss-rebuild/pkg/build"
+	dockerlocal "github.com/google/oss-rebuild/pkg/docker/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
 	"github.com/pkg/errors"
 )
@@ -29,9 +30,8 @@ type DockerRunExecutor struct {
 	planner          build.Planner[*DockerRunPlan]
 	maxParallel      int
 	semaphore        chan struct{}
-	dockerCmd        string
-	cmdExecutor      CommandExecutor
-	activeBuilds     syncx.Map[string, *localHandle]
+	client           dockerlocal.Client
+	activeBuilds     syncx.Map[string, *dockerlocal.LocalHandle]
 	outputBufferSize int
 	retainContainer  bool
 	keepalive        bool
@@ -49,7 +49,7 @@ func NewDockerRunExecutor(config DockerRunExecutorConfig) (*DockerRunExecutor, e
 	}
 	cmdExecutor := config.CommandExecutor
 	if cmdExecutor == nil {
-		cmdExecutor = NewRealCommandExecutor()
+		cmdExecutor = dockerlocal.NewRealCommandExecutor()
 	}
 	maxParallel := config.MaxParallel
 	if maxParallel <= 0 {
@@ -72,9 +72,8 @@ func NewDockerRunExecutor(config DockerRunExecutorConfig) (*DockerRunExecutor, e
 		planner:          planner,
 		maxParallel:      maxParallel,
 		semaphore:        make(chan struct{}, maxParallel),
-		dockerCmd:        dockerCmd,
-		cmdExecutor:      cmdExecutor,
-		activeBuilds:     syncx.Map[string, *localHandle]{},
+		client:           dockerlocal.NewRealClient(cmdExecutor, dockerCmd),
+		activeBuilds:     syncx.Map[string, *dockerlocal.LocalHandle]{},
 		outputBufferSize: outputBufferSize,
 		retainContainer:  config.RetainContainer,
 		keepalive:        config.KeepAlive,
@@ -90,7 +89,7 @@ type AuthCallback func() (string, error)
 // DockerRunExecutorConfig contains configuration for creating a Docker run executor
 type DockerRunExecutorConfig struct {
 	Planner          build.Planner[*DockerRunPlan]
-	CommandExecutor  CommandExecutor
+	CommandExecutor  dockerlocal.CommandExecutor
 	MaxParallel      int          // Max number of simultaneous builds
 	OutputBufferSize int          // Buffer size for output pipe, defaults to 512KB
 	RetainContainer  bool         // If true, don't use --rm flag to retain containers
@@ -121,13 +120,7 @@ func (e *DockerRunExecutor) Start(ctx context.Context, input rebuild.Input, opts
 		buildCtx, cancel = context.WithTimeout(buildCtx, opts.Timeout)
 	}
 	pipe := bufiox.NewBufferedPipe(bufiox.NewLineBuffer(e.outputBufferSize))
-	handle := &localHandle{
-		id:         buildID,
-		cancel:     cancel,
-		output:     pipe,
-		resultChan: make(chan build.Result, 1),
-		status:     build.BuildStateStarting,
-	}
+	handle := dockerlocal.NewLocalHandle(buildID, cancel, pipe)
 	e.activeBuilds.Store(buildID, handle)
 	// Start the build in a goroutine
 	go e.executeBuild(buildCtx, handle, plan, input.Target, opts)
@@ -147,8 +140,8 @@ func (e *DockerRunExecutor) Status() build.ExecutorStatus {
 func (e *DockerRunExecutor) Close(ctx context.Context) error {
 	// Cancel all active builds
 	for handle := range e.activeBuilds.Values() {
-		handle.cancel()
-		handle.updateStatus(build.BuildStateCancelled)
+		handle.Cancel()
+		handle.UpdateStatus(build.BuildStateCancelled)
 	}
 	// Wait for builds to finish or context timeout
 	done := make(chan struct{})
@@ -167,26 +160,26 @@ func (e *DockerRunExecutor) Close(ctx context.Context) error {
 }
 
 // executeBuild runs the actual Docker run process
-func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *localHandle, plan *DockerRunPlan, t rebuild.Target, opts build.Options) {
-	defer e.activeBuilds.Delete(handle.id)
-	defer handle.output.Close()
+func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *dockerlocal.LocalHandle, plan *DockerRunPlan, t rebuild.Target, opts build.Options) {
+	defer e.activeBuilds.Delete(handle.BuildID())
+	defer handle.OutputStream().(io.Closer).Close()
 	// Acquire semaphore slot
 	select {
 	case e.semaphore <- struct{}{}:
 		defer func() { <-e.semaphore }()
 	case <-ctx.Done():
-		handle.updateStatus(build.BuildStateCancelled)
-		handle.setResult(build.Result{
+		handle.UpdateStatus(build.BuildStateCancelled)
+		handle.SetResult(build.Result{
 			Error: errors.Wrap(ctx.Err(), "enqueuing build"),
 		})
 		return
 	}
 	// Create temporary directory for build output
-	hostOutputPath := filepath.Join(e.tempDirBase, fmt.Sprintf("oss-rebuild-%s", handle.id))
+	hostOutputPath := filepath.Join(e.tempDirBase, fmt.Sprintf("oss-rebuild-%s", handle.BuildID()))
 	err := os.MkdirAll(hostOutputPath, 0755)
 	if err != nil {
-		handle.updateStatus(build.BuildStateCancelled)
-		handle.setResult(build.Result{
+		handle.UpdateStatus(build.BuildStateCancelled)
+		handle.SetResult(build.Result{
 			Error: errors.Wrap(err, "failed to create temporary directory"),
 		})
 		return
@@ -197,11 +190,12 @@ func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *localHandl
 		}
 	}()
 	// Compose command args
-	runArgs := []string{"run"}
+	// Note: e.client.Run prepends "run" automatically.
+	var runArgs []string
 	if !e.retainContainer {
 		runArgs = append(runArgs, "--rm")
 	}
-	runArgs = append(runArgs, "--name", handle.id) // Use BuildID as container name
+	runArgs = append(runArgs, "--name", handle.BuildID()) // Use BuildID as container name
 	runArgs = append(runArgs, "-v", fmt.Sprintf("%s:%s", hostOutputPath, path.Dir(plan.OutputPath)))
 	if plan.WorkingDir != "" {
 		runArgs = append(runArgs, "-w", plan.WorkingDir)
@@ -218,8 +212,8 @@ func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *localHandl
 	if plan.RequiresAuth && e.authCallback != nil {
 		authHeader, err := e.authCallback()
 		if err != nil {
-			handle.updateStatus(build.BuildStateCancelled)
-			handle.setResult(build.Result{
+			handle.UpdateStatus(build.BuildStateCancelled)
+			handle.SetResult(build.Result{
 				Error: errors.Wrap(err, "failed to generate auth header"),
 			})
 			return
@@ -232,8 +226,8 @@ func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *localHandl
 		// To keep the container alive, we need to execute the build script in the background and keep an infinte process in the forground.
 		// Write the script to a file then execute it in the background
 		if strings.Contains(plan.Script, "EOF") {
-			handle.updateStatus(build.BuildStateCompleted)
-			handle.setResult(build.Result{
+			handle.UpdateStatus(build.BuildStateCompleted)
+			handle.SetResult(build.Result{
 				Error: errors.New("build script contains unexpected 'EOF' literal"),
 			})
 		}
@@ -243,12 +237,12 @@ func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *localHandl
 		runArgs = append(runArgs, "/bin/sh", "-c", plan.Script)
 	}
 	// Execute the Docker run command with streaming output
-	handle.updateStatus(build.BuildStateRunning)
+	handle.UpdateStatus(build.BuildStateRunning)
 	outbuf := &bytes.Buffer{}
 	runWriter := io.MultiWriter(handle, outbuf)
-	buildErr := e.cmdExecutor.Execute(ctx, CommandOptions{
-		Output: runWriter,
-	}, e.dockerCmd, runArgs...)
+
+	buildErr := e.client.Run(ctx, "", runWriter, runArgs)
+
 	// Upload assets to asset store
 	// NOTE: Upload failures don't fail the build
 	if opts.Resources.AssetStore != nil {
@@ -262,8 +256,8 @@ func (e *DockerRunExecutor) executeBuild(ctx context.Context, handle *localHandl
 			log.Printf("Failed to upload debug logs: %v", err)
 		}
 	}
-	handle.updateStatus(build.BuildStateCompleted)
-	handle.setResult(build.Result{
+	handle.UpdateStatus(build.BuildStateCompleted)
+	handle.SetResult(build.Result{
 		Error: errors.Wrap(buildErr, "docker run failed"),
 	})
 }

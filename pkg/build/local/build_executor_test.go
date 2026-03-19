@@ -14,6 +14,7 @@ import (
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/oss-rebuild/pkg/build"
+	dockerlocal "github.com/google/oss-rebuild/pkg/docker/local"
 	"github.com/google/oss-rebuild/pkg/rebuild/rebuild"
 	"github.com/pkg/errors"
 )
@@ -43,9 +44,9 @@ type buildTestCase struct {
 	input            rebuild.Input
 	options          build.Options
 	maxParallel      int
-	executeFunc      func(ctx context.Context, opts CommandOptions, name string, args ...string) error
+	executeFunc      func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error
 	lookPathFunc     func(file string) (string, error)
-	expectedCommands []MockCommand
+	expectedCommands []dockerlocal.MockCommand
 	expectedError    string
 	expectSuccess    bool
 	retainContainer  bool
@@ -75,7 +76,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 				},
 			},
 			maxParallel: 2,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if opts.Output != nil {
 					if len(args) > 0 && args[0] == "build" {
 						opts.Output.Write([]byte("Successfully built image\n"))
@@ -85,7 +86,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name:  "docker",
 					Args:  []string{"buildx", "build", "-t", "test-build-123", "-"},
@@ -145,13 +146,13 @@ func TestDockerBuildExecutor(t *testing.T) {
 				BuildID: "test-build-789",
 			},
 			maxParallel: 1,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if len(args) > 0 && args[0] == "buildx" {
 					return errors.New("docker build failed: exit status 1")
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name:  "docker",
 					Args:  []string{"buildx", "build", "-t", "test-build-789", "-"},
@@ -178,13 +179,13 @@ func TestDockerBuildExecutor(t *testing.T) {
 				BuildID: "test-build-run-fail",
 			},
 			maxParallel: 1,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if len(args) > 0 && args[0] == "run" {
 					return errors.New("container exited with code 1")
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name:  "docker",
 					Args:  []string{"buildx", "build", "-t", "test-build-run-fail", "-"},
@@ -224,7 +225,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 			},
 			maxParallel:     1,
 			retainContainer: true,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if opts.Output != nil {
 					if len(args) > 0 && args[0] == "build" {
 						opts.Output.Write([]byte("Successfully built image\n"))
@@ -234,7 +235,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name:  "docker",
 					Args:  []string{"buildx", "build", "-t", "test-build-retain-container", "-"},
@@ -277,7 +278,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 			},
 			maxParallel: 1,
 			retainImage: true,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				if opts.Output != nil {
 					if len(args) > 0 && args[0] == "build" {
 						opts.Output.Write([]byte("Successfully built image\n"))
@@ -287,7 +288,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 				}
 				return nil
 			},
-			expectedCommands: []MockCommand{
+			expectedCommands: []dockerlocal.MockCommand{
 				{
 					Name:  "docker",
 					Args:  []string{"buildx", "build", "-t", "test-build-retain-image", "-"},
@@ -338,7 +339,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 				Timeout: 50 * time.Millisecond,
 			},
 			maxParallel: 1,
-			executeFunc: func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+			executeFunc: func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 				select {
 				case <-time.After(100 * time.Millisecond):
 					return nil
@@ -353,7 +354,7 @@ func TestDockerBuildExecutor(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup mock command executor
-			cmdExecutor := NewMockCommandExecutor()
+			cmdExecutor := dockerlocal.NewMockCommandExecutor()
 			if tc.executeFunc != nil {
 				cmdExecutor.SetExecuteFunc(tc.executeFunc)
 			}
@@ -451,14 +452,14 @@ func TestDockerBuildExecutor(t *testing.T) {
 
 func TestDockerBuildExecutorConcurrency(t *testing.T) {
 	maxParallel := 2
-	cmdExecutor := NewMockCommandExecutor()
+	cmdExecutor := dockerlocal.NewMockCommandExecutor()
 
 	// Setup slow execution to test concurrency
 	var activeBuilds int32
 	var maxActiveBuilds int32
 	var mu sync.Mutex
 
-	cmdExecutor.SetExecuteFunc(func(ctx context.Context, opts CommandOptions, name string, args ...string) error {
+	cmdExecutor.SetExecuteFunc(func(ctx context.Context, opts dockerlocal.CommandOptions, name string, args ...string) error {
 		mu.Lock()
 		activeBuilds++
 		if activeBuilds > maxActiveBuilds {
@@ -549,7 +550,7 @@ func TestDockerBuildExecutorConfig(t *testing.T) {
 	executor, err := NewDockerBuildExecutor(DockerBuildExecutorConfig{
 		MaxParallel:     3,
 		OutputDir:       "/custom/output",
-		CommandExecutor: NewMockCommandExecutor(),
+		CommandExecutor: dockerlocal.NewMockCommandExecutor(),
 	})
 	if err != nil {
 		t.Fatalf("Failed to create executor with config: %v", err)

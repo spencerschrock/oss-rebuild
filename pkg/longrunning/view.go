@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/google/oss-rebuild/internal/db"
+	"github.com/google/oss-rebuild/pkg/db"
 )
 
 var ErrNotFound = errors.New("operation not found")

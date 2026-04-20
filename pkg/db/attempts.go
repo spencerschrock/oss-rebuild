@@ -16,14 +16,14 @@ type AttemptKey struct {
 	RunID  string
 }
 
-func attemptPath(a schema.RebuildAttempt) []string {
-	return attemptKeyPath(AttemptKey{Target: a.Target(), RunID: a.RunID})
+func attemptPath(rootCollection string, a schema.RebuildAttempt) []string {
+	return attemptKeyPath(rootCollection, AttemptKey{Target: a.Target(), RunID: a.RunID})
 }
 
-func attemptKeyPath(k AttemptKey) []string {
+func attemptKeyPath(rootCollection string, k AttemptKey) []string {
 	et := rebuild.FirestoreTargetEncoding.Encode(k.Target)
 	return []string{
-		"ecosystem", string(et.Ecosystem),
+		rootCollection, string(et.Ecosystem),
 		"packages", et.Package,
 		"versions", et.Version,
 		"artifacts", et.Artifact,
@@ -32,9 +32,25 @@ func attemptKeyPath(k AttemptKey) []string {
 }
 
 func NewFirestoreAttempts(c *firestore.Client) Attempts {
-	return &firestoreResource[schema.RebuildAttempt, AttemptKey]{client: c, pathFor: attemptPath, pathForKey: attemptKeyPath}
+	return NewFirestoreAttemptsWithRoot(c, "ecosystem")
+}
+
+func NewFirestoreAttemptsWithRoot(c *firestore.Client, rootCollection string) Attempts {
+	return &firestoreResource[schema.RebuildAttempt, AttemptKey]{
+		client:     c,
+		pathFor:    func(a schema.RebuildAttempt) []string { return attemptPath(rootCollection, a) },
+		pathForKey: func(k AttemptKey) []string { return attemptKeyPath(rootCollection, k) },
+	}
 }
 
 func NewMemoryAttempts() Attempts {
-	return &memoryResource[schema.RebuildAttempt, AttemptKey]{data: map[string]schema.RebuildAttempt{}, pathFor: attemptPath, pathForKey: attemptKeyPath}
+	return NewMemoryAttemptsWithRoot("ecosystem")
+}
+
+func NewMemoryAttemptsWithRoot(rootCollection string) Attempts {
+	return &memoryResource[schema.RebuildAttempt, AttemptKey]{
+		data:       map[string]schema.RebuildAttempt{},
+		pathFor:    func(a schema.RebuildAttempt) []string { return attemptPath(rootCollection, a) },
+		pathForKey: func(k AttemptKey) []string { return attemptKeyPath(rootCollection, k) },
+	}
 }

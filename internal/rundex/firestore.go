@@ -220,7 +220,7 @@ func (f *FirestoreClient) fetchRebuildsQuery(ctx context.Context, q firestore.Qu
 // FetchAttempt fetches a specific Rebuild object out of firestore.
 func (f *FirestoreClient) FetchAttempt(ctx context.Context, target rebuild.Target, runID string) (Rebuild, error) {
 	et := rebuild.FirestoreTargetEncoding.Encode(target)
-	doc, err := f.client.Collection(path.Join("ecosystem", string(et.Ecosystem), "packages", et.Package, "versions", et.Version, "artifacts", et.Artifact, "attempts")).Doc(runID).Get(ctx)
+	doc, err := f.client.Collection(path.Join("retest-ecosystem", string(et.Ecosystem), "packages", et.Package, "versions", et.Version, "artifacts", et.Artifact, "attempts")).Doc(runID).Get(ctx)
 	if err != nil {
 		return Rebuild{}, err
 	}
